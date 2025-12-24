@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git ls-tree:*)",
+      "Bash(cat:*)",
+      "Bash(tree:*)",
+      "Bash(powershell:*)",
+      "Bash(dir \"c:\\\\Users\\\\y3kma\\\\Documents\\\\Development\\\\dataplatform\")"
+    ]
+  }
+}

@@ -1,0 +1,57 @@
+# Prometheus configuration for development environment
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    environment: 'development'
+    platform: 'data-platform'
+
+# Alertmanager configuration (optional)
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets:
+#           - localhost:9093
+
+# Rule files
+rule_files:
+  # - "alerts/*.yml"
+
+# Scrape configurations
+scrape_configs:
+  # Prometheus itself
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Data Platform API
+  - job_name: 'dataplatform-api'
+    static_configs:
+      - targets: ['host.docker.internal:8000']
+    metrics_path: '/metrics'
+
+  # MCP Servers
+  - job_name: 'mcp-servers'
+    static_configs:
+      - targets:
+        - 'host.docker.internal:8001'  # Data server
+        - 'host.docker.internal:8002'  # Metadata server
+        - 'host.docker.internal:8003'  # Query server
+        - 'host.docker.internal:8004'  # Lineage server
+    metrics_path: '/metrics'
+
+  # Kafka exporters (if available)
+  - job_name: 'kafka'
+    static_configs:
+      - targets: ['kafka-1:9101', 'kafka-2:9102', 'kafka-3:9103']
+
+  # PostgreSQL exporter (if available)
+  # - job_name: 'postgres'
+  #   static_configs:
+  #     - targets: ['postgres-exporter:9187']
+
+  # Flink metrics (if exposed)
+  # - job_name: 'flink'
+  #   static_configs:
+  #     - targets: ['flink-jobmanager:9249']
