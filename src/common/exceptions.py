@@ -104,6 +104,24 @@ class KafkaError(DataPlatformError):
     pass
 
 
+class KafkaAdminError(KafkaError):
+    """Raised when Kafka admin operations fail."""
+
+    pass
+
+
+class KafkaProducerError(KafkaError):
+    """Raised when Kafka producer operations fail."""
+
+    pass
+
+
+class KafkaConsumerError(KafkaError):
+    """Raised when Kafka consumer operations fail."""
+
+    pass
+
+
 class FlinkError(DataPlatformError):
     """Raised when Flink job operations fail."""
 

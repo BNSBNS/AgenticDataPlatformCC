@@ -5,7 +5,12 @@
       "Bash(cat:*)",
       "Bash(tree:*)",
       "Bash(powershell:*)",
-      "Bash(dir \"c:\\\\Users\\\\y3kma\\\\Documents\\\\Development\\\\dataplatform\")"
+      "Bash(dir \"c:\\\\Users\\\\y3kma\\\\Documents\\\\Development\\\\dataplatform\")",
+      "Bash(python -m pytest:*)",
+      "Bash(poetry install:*)",
+      "Bash(python -m pip install:*)",
+      "Bash(python -m py_compile:*)",
+      "Bash(python -c:*)"
     ]
   }
 }
