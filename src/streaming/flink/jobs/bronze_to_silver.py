@@ -7,9 +7,17 @@ Reads from Kafka raw topics, validates, cleanses, and writes to Silver layer.
 from typing import Dict, Any
 from datetime import datetime
 
-from pyflink.datastream import StreamExecutionEnvironment
-from pyflink.datastream.functions import MapFunction
-from pyflink.common.serialization import SimpleStringSchema
+# Try to import PyFlink - it's an optional dependency
+try:
+    from pyflink.datastream import StreamExecutionEnvironment
+    from pyflink.datastream.functions import MapFunction
+    from pyflink.common.serialization import SimpleStringSchema
+    PYFLINK_AVAILABLE = True
+except ImportError:
+    PYFLINK_AVAILABLE = False
+    StreamExecutionEnvironment = None
+    MapFunction = None
+    SimpleStringSchema = None
 
 from src.common.logging import get_logger
 from src.common.config import get_config
@@ -30,7 +38,17 @@ class BronzeToSilverJob:
     """
 
     def __init__(self):
-        """Initialize Bronze to Silver job."""
+        """
+        Initialize Bronze to Silver job.
+
+        Raises:
+            ImportError: If PyFlink is not installed
+        """
+        if not PYFLINK_AVAILABLE:
+            raise ImportError(
+                "PyFlink not installed. Install with: pip install apache-flink"
+            )
+
         self.config = get_config()
         self.env = StreamExecutionEnvironment.get_execution_environment()
 

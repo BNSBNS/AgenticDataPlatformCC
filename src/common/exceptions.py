@@ -168,3 +168,15 @@ class NonRetryableError(DataPlatformError):
     """Base class for errors that should not trigger retry logic."""
 
     pass
+
+
+class CircuitBreakerOpenError(DataPlatformError):
+    """Raised when circuit breaker is open and rejects calls."""
+
+    pass
+
+
+class TimeoutError(DataPlatformError):
+    """Raised when an operation times out."""
+
+    pass

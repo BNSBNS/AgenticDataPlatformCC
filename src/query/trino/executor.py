@@ -3,8 +3,16 @@ Trino query executor for federated queries across lakehouse.
 """
 
 from typing import List, Dict, Any, Optional
-from trino.dbapi import connect
-from trino.auth import BasicAuthentication
+
+# Try to import Trino client - it's an optional dependency
+try:
+    from trino.dbapi import connect
+    from trino.auth import BasicAuthentication
+    TRINO_AVAILABLE = True
+except ImportError:
+    TRINO_AVAILABLE = False
+    connect = None
+    BasicAuthentication = None
 
 from src.common.config import get_config
 from src.common.logging import get_logger
@@ -36,7 +44,15 @@ class TrinoQueryExecutor:
             port: Trino coordinator port
             user: Authentication user
             catalog: Default catalog
+
+        Raises:
+            ImportError: If Trino client is not installed
         """
+        if not TRINO_AVAILABLE:
+            raise ImportError(
+                "Trino client not installed. Install with: pip install trino"
+            )
+
         self.config = get_config()
         self.host = host or "localhost"
         self.port = port

@@ -10,8 +10,8 @@ from typing import Dict, List, Optional, Any, Union
 import json
 import time
 
-from kafka import KafkaProducer
-from kafka.errors import KafkaError, KafkaTimeoutError
+from confluent_kafka import Producer, KafkaException
+from confluent_kafka.error import KafkaError
 
 from src.common.config import get_config
 from src.common.logging import get_logger
@@ -66,30 +66,25 @@ class ProducerConfig:
         Returns:
             Dictionary of Kafka configuration parameters
         """
+        # confluent-kafka uses dot notation for config keys
         config = {
-            "bootstrap_servers": self.bootstrap_servers,
-            "client_id": self.client_id,
-            "acks": self.acks,
-            "retries": self.retries,
-            "batch_size": self.batch_size,
-            "linger_ms": self.linger_ms,
-            "max_request_size": self.max_request_size,
+            "bootstrap.servers": self.bootstrap_servers,
+            "client.id": self.client_id,
+            "acks": str(self.acks),
+            "retries": str(self.retries),
+            "batch.size": str(self.batch_size),
+            "linger.ms": str(self.linger_ms),
+            "message.max.bytes": str(self.max_request_size),
         }
 
         if self.compression_type:
-            config["compression_type"] = self.compression_type
+            config["compression.type"] = self.compression_type
 
         if self.transactional_id:
-            config["transactional_id"] = self.transactional_id
+            config["transactional.id"] = self.transactional_id
 
-        # Add serializers
-        if self.value_serializer == "json":
-            config["value_serializer"] = lambda v: json.dumps(v).encode("utf-8")
-        elif self.value_serializer == "string":
-            config["value_serializer"] = lambda v: str(v).encode("utf-8")
-
-        if self.key_serializer == "string":
-            config["key_serializer"] = lambda k: str(k).encode("utf-8") if k else None
+        # Note: confluent-kafka doesn't use serializer functions in config
+        # Serialization is handled at send time
 
         # Merge additional config
         config.update(self.additional_config)
@@ -116,7 +111,7 @@ class KafkaProducerManager:
 
         # Initialize Kafka producer
         kafka_config = config.to_kafka_config()
-        self._producer = KafkaProducer(**kafka_config)
+        self._producer = Producer(kafka_config)
 
         # Initialize transactions if configured
         if config.transactional_id:
@@ -151,35 +146,31 @@ class KafkaProducerManager:
         Returns:
             Dictionary with send result
         """
-        retries = max_retries or self.config.retries
-        attempt = 0
-        last_error = None
-
         start_time = time.time()
+        result = {"success": False, "error": None}
 
-        while attempt <= retries:
-            try:
-                # Prepare headers
-                kafka_headers = None
-                if headers:
-                    kafka_headers = [
-                        (k, v.encode("utf-8")) for k, v in headers.items()
-                    ]
+        def delivery_callback(err, msg):
+            """Callback for delivery reports."""
+            nonlocal result
+            latency = time.time() - start_time
 
-                # Send message
-                future = self._producer.send(
-                    topic,
-                    value=message,
-                    key=key,
-                    partition=partition,
-                    headers=kafka_headers,
-                )
+            if err is not None:
+                result["success"] = False
+                result["error"] = str(err)
+                kafka_messages_produced_total.labels(
+                    topic=topic, status="error"
+                ).inc()
+                kafka_producer_errors_total.labels(
+                    topic=topic, error_type="delivery_failed"
+                ).inc()
+                logger.error(f"Message delivery failed: {err}")
+            else:
+                result["success"] = True
+                result["topic"] = msg.topic()
+                result["partition"] = msg.partition()
+                result["offset"] = msg.offset()
+                result["timestamp"] = msg.timestamp()[1] if msg.timestamp()[0] != -1 else None
 
-                # Wait for result
-                record_metadata = future.get(timeout=10)
-
-                # Record metrics
-                latency = time.time() - start_time
                 kafka_messages_produced_total.labels(
                     topic=topic, status="success"
                 ).inc()
@@ -187,42 +178,70 @@ class KafkaProducerManager:
 
                 logger.debug(
                     "Message sent successfully",
-                    topic=topic,
-                    partition=record_metadata.partition,
-                    offset=record_metadata.offset,
+                    topic=msg.topic(),
+                    partition=msg.partition(),
+                    offset=msg.offset(),
                 )
 
-                return {
-                    "success": True,
-                    "topic": record_metadata.topic,
-                    "partition": record_metadata.partition,
-                    "offset": record_metadata.offset,
-                    "timestamp": record_metadata.timestamp,
-                }
+        try:
+            # Serialize message based on config
+            if self.config.value_serializer == "json":
+                value = json.dumps(message).encode("utf-8")
+            elif self.config.value_serializer == "string":
+                value = str(message).encode("utf-8")
+            else:
+                value = message if isinstance(message, bytes) else str(message).encode("utf-8")
 
-            except KafkaTimeoutError as e:
-                last_error = e
-                attempt += 1
-                if attempt <= retries:
-                    logger.warning(
-                        f"Send timeout, retrying ({attempt}/{retries})",
-                        topic=topic,
-                    )
-                    time.sleep(0.1 * attempt)  # Exponential backoff
-            except Exception as e:
-                last_error = e
-                logger.error(f"Failed to send message to {topic}: {e}")
-                break
+            # Serialize key
+            key_bytes = None
+            if key:
+                if self.config.key_serializer == "string":
+                    key_bytes = str(key).encode("utf-8")
+                else:
+                    key_bytes = key if isinstance(key, bytes) else str(key).encode("utf-8")
 
-        # All retries exhausted
-        kafka_messages_produced_total.labels(topic=topic, status="error").inc()
-        kafka_producer_errors_total.labels(topic=topic, error_type="send_failed").inc()
+            # Prepare headers
+            kafka_headers = None
+            if headers:
+                kafka_headers = [
+                    (k, v.encode("utf-8") if isinstance(v, str) else v)
+                    for k, v in headers.items()
+                ]
 
-        return {
-            "success": False,
-            "error": str(last_error),
-            "attempts": attempt,
-        }
+            # Send message (asynchronous with callback)
+            self._producer.produce(
+                topic,
+                value=value,
+                key=key_bytes,
+                partition=partition if partition is not None else -1,
+                headers=kafka_headers,
+                on_delivery=delivery_callback,
+            )
+
+            # Poll to trigger callback
+            self._producer.poll(0)
+
+            # Flush to wait for delivery
+            self._producer.flush(timeout=10)
+
+            return result
+
+        except BufferError as e:
+            # Queue is full, wait and retry
+            logger.warning(f"Producer queue full, waiting: {e}")
+            self._producer.poll(1)
+            kafka_producer_errors_total.labels(
+                topic=topic, error_type="buffer_full"
+            ).inc()
+            return {"success": False, "error": "Buffer full"}
+
+        except Exception as e:
+            logger.error(f"Failed to send message to {topic}: {e}")
+            kafka_messages_produced_total.labels(topic=topic, status="error").inc()
+            kafka_producer_errors_total.labels(
+                topic=topic, error_type="send_failed"
+            ).inc()
+            return {"success": False, "error": str(e)}
 
     def send_batch(
         self,
@@ -302,10 +321,14 @@ class KafkaProducerManager:
         Get producer metrics.
 
         Returns:
-            Dictionary of metrics
+            Dictionary of metrics (length of outstanding messages queue)
         """
         try:
-            return self._producer.metrics()
+            # confluent-kafka doesn't have metrics() method
+            # Return queue length instead
+            return {
+                "queue_length": len(self._producer),
+            }
         except Exception as e:
             logger.error(f"Failed to get producer metrics: {e}")
             return {}

@@ -9,19 +9,14 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
 import time
 
-from kafka.admin import (
+from confluent_kafka.admin import (
     AdminClient,
     NewTopic,
     ConfigResource,
-    ConfigResourceType,
+    ResourceType,
 )
-from kafka.errors import (
-    TopicAlreadyExistsError,
-    UnknownTopicOrPartitionError,
-    KafkaError,
-)
-from kafka import KafkaConsumer
-from kafka.structs import TopicPartition
+from confluent_kafka import KafkaException, Consumer
+from confluent_kafka.error import KafkaError
 
 from src.common.config import get_config
 from src.common.logging import get_logger
@@ -152,12 +147,16 @@ class KafkaAdminManager:
                         operation="create_topic", status="success"
                     ).inc()
                     return True
-                except TopicAlreadyExistsError:
-                    if skip_if_exists:
-                        logger.info("Topic already exists, skipping", topic=topic_name)
-                        return True
+                except KafkaException as ke:
+                    # Check if topic already exists
+                    if ke.args[0].code() == KafkaError.TOPIC_ALREADY_EXISTS:
+                        if skip_if_exists:
+                            logger.info("Topic already exists, skipping", topic=topic_name)
+                            return True
+                        else:
+                            raise KafkaAdminError(f"Topic {topic_name} already exists")
                     else:
-                        raise KafkaAdminError(f"Topic {topic_name} already exists")
+                        raise
 
         except Exception as e:
             logger.error(f"Failed to create topic {topic_config.name}: {e}")
@@ -193,9 +192,13 @@ class KafkaAdminManager:
                         operation="delete_topic", status="success"
                     ).inc()
                     return True
-                except UnknownTopicOrPartitionError:
-                    logger.warning("Topic does not exist", topic=topic)
-                    return False
+                except KafkaException as ke:
+                    # Check if topic doesn't exist
+                    if ke.args[0].code() == KafkaError.UNKNOWN_TOPIC_OR_PART:
+                        logger.warning("Topic does not exist", topic=topic)
+                        return False
+                    else:
+                        raise
 
         except Exception as e:
             logger.error(f"Failed to delete topic {topic_name}: {e}")
@@ -294,12 +297,14 @@ class KafkaAdminManager:
             Dictionary of configuration parameters
         """
         try:
-            resource = ConfigResource(ConfigResourceType.TOPIC, topic_name)
-            result = self._admin.describe_configs([resource])
+            resource = ConfigResource(ResourceType.TOPIC, topic_name)
+            futures = self._admin.describe_configs([resource])
 
             configs = {}
-            for resource_result in result.resources:
-                for config_name, config_entry in resource_result.configs.items():
+            # Wait for the future to complete
+            for future in futures.values():
+                config_resource = future.result()
+                for config_name, config_entry in config_resource.items():
                     configs[config_name] = config_entry.value
 
             return configs
@@ -330,7 +335,7 @@ class KafkaAdminManager:
             )
 
             resource = ConfigResource(
-                ConfigResourceType.TOPIC, topic_name, configs=config_updates
+                ResourceType.TOPIC, topic_name, set_config=config_updates
             )
 
             future_map = self._admin.alter_configs([resource])
@@ -432,36 +437,40 @@ class KafkaAdminManager:
             Dictionary mapping partition to offset info
         """
         try:
-            # Create temporary consumer to get offsets
-            consumer = KafkaConsumer(
-                bootstrap_servers=self.bootstrap_servers,
-                group_id=f"admin-offset-check-{int(time.time())}",
-                enable_auto_commit=False,
-            )
+            from confluent_kafka import TopicPartition, OFFSET_BEGINNING, OFFSET_END
 
-            # Get partitions for topic
-            partitions = consumer.partitions_for_topic(topic_name)
-            if partitions is None:
+            # Create temporary consumer to get offsets
+            consumer = Consumer({
+                'bootstrap.servers': self.bootstrap_servers,
+                'group.id': f"admin-offset-check-{int(time.time())}",
+                'enable.auto.commit': False,
+            })
+
+            # Get metadata for topic
+            metadata = self._admin.list_topics(topic=topic_name, timeout=10)
+
+            if topic_name not in metadata.topics:
                 raise KafkaAdminError(f"Topic {topic_name} not found")
 
-            topic_partitions = [
-                TopicPartition(topic_name, p) for p in partitions
-            ]
-
-            # Get beginning and end offsets
-            beginning_offsets = consumer.beginning_offsets(topic_partitions)
-            end_offsets = consumer.end_offsets(topic_partitions)
-
-            consumer.close()
+            topic_metadata = metadata.topics[topic_name]
+            partitions = list(topic_metadata.partitions.keys())
 
             # Build offset info
             offset_info = {}
-            for tp in topic_partitions:
-                offset_info[tp.partition] = {
-                    "earliest": beginning_offsets[tp],
-                    "latest": end_offsets[tp],
+            for partition_id in partitions:
+                # Get earliest offset
+                tp_beginning = TopicPartition(topic_name, partition_id, OFFSET_BEGINNING)
+                low_offset, high_offset = consumer.get_watermark_offsets(
+                    TopicPartition(topic_name, partition_id),
+                    timeout=10
+                )
+
+                offset_info[partition_id] = {
+                    "earliest": low_offset,
+                    "latest": high_offset,
                 }
 
+            consumer.close()
             return offset_info
 
         except Exception as e:

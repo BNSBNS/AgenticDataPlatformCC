@@ -3,8 +3,18 @@ Qdrant vector store for semantic search.
 """
 
 from typing import List, Dict, Any, Optional
-from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
+
+# Try to import Qdrant client - it's an optional dependency
+try:
+    from qdrant_client import QdrantClient
+    from qdrant_client.models import Distance, VectorParams, PointStruct
+    QDRANT_AVAILABLE = True
+except ImportError:
+    QDRANT_AVAILABLE = False
+    QdrantClient = None
+    Distance = None
+    VectorParams = None
+    PointStruct = None
 
 from src.common.config import get_config
 from src.common.logging import get_logger
@@ -34,7 +44,15 @@ class QdrantVectorStore:
             host: Qdrant host
             port: Qdrant port
             collection_name: Default collection name
+
+        Raises:
+            ImportError: If Qdrant client is not installed
         """
+        if not QDRANT_AVAILABLE:
+            raise ImportError(
+                "Qdrant client not installed. Install with: pip install qdrant-client"
+            )
+
         self.config = get_config()
         self.host = host or "localhost"
         self.port = port

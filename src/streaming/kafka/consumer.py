@@ -10,8 +10,8 @@ from typing import Dict, List, Optional, Any, Tuple
 import json
 import re
 
-from kafka import KafkaConsumer, TopicPartition, OffsetAndMetadata
-from kafka.errors import KafkaError
+from confluent_kafka import Consumer, TopicPartition, KafkaException, OFFSET_BEGINNING, OFFSET_END
+from confluent_kafka.error import KafkaError
 
 from src.common.config import get_config
 from src.common.logging import get_logger
@@ -66,30 +66,20 @@ class ConsumerConfig:
         Returns:
             Dictionary of Kafka configuration parameters
         """
+        # confluent-kafka uses dot notation for config keys
         config = {
-            "bootstrap_servers": self.bootstrap_servers,
-            "group_id": self.group_id,
-            "client_id": self.client_id,
-            "auto_offset_reset": self.auto_offset_reset,
-            "enable_auto_commit": self.enable_auto_commit,
-            "auto_commit_interval_ms": self.auto_commit_interval_ms,
-            "max_poll_records": self.max_poll_records,
-            "session_timeout_ms": self.session_timeout_ms,
-            "heartbeat_interval_ms": self.heartbeat_interval_ms,
+            "bootstrap.servers": self.bootstrap_servers,
+            "group.id": self.group_id,
+            "client.id": self.client_id,
+            "auto.offset.reset": self.auto_offset_reset,
+            "enable.auto.commit": str(self.enable_auto_commit).lower(),
+            "auto.commit.interval.ms": str(self.auto_commit_interval_ms),
+            "session.timeout.ms": str(self.session_timeout_ms),
+            "heartbeat.interval.ms": str(self.heartbeat_interval_ms),
         }
 
-        # Add deserializers
-        if self.value_deserializer == "json":
-            config["value_deserializer"] = lambda v: json.loads(v.decode("utf-8")) if v else None
-        elif self.value_deserializer == "string":
-            config["value_deserializer"] = lambda v: v.decode("utf-8") if v else None
-        elif self.value_deserializer == "bytes":
-            config["value_deserializer"] = lambda v: v
-
-        if self.key_deserializer == "string":
-            config["key_deserializer"] = lambda k: k.decode("utf-8") if k else None
-        elif self.key_deserializer == "bytes":
-            config["key_deserializer"] = lambda k: k
+        # Note: confluent-kafka doesn't use deserializer functions in config
+        # Deserialization is handled when processing messages
 
         # Merge additional config
         config.update(self.additional_config)
@@ -116,7 +106,11 @@ class KafkaConsumerManager:
 
         # Initialize Kafka consumer
         kafka_config = config.to_kafka_config()
-        self._consumer = KafkaConsumer(*config.topics, **kafka_config)
+        self._consumer = Consumer(kafka_config)
+
+        # Subscribe to topics
+        if config.topics:
+            self._consumer.subscribe(config.topics)
 
         logger.info(
             "Kafka consumer initialized",
@@ -161,37 +155,64 @@ class KafkaConsumerManager:
             List of consumed messages
         """
         try:
-            # Poll for messages
-            message_batch = self._consumer.poll(
-                timeout_ms=timeout_ms,
-                max_records=max_messages or self.config.max_poll_records,
-            )
-
             messages = []
+            max_msgs = max_messages or self.config.max_poll_records
+            timeout_seconds = timeout_ms / 1000.0
 
-            for topic_partition, records in message_batch.items():
-                for record in records:
-                    message = {
-                        "topic": record.topic,
-                        "partition": record.partition,
-                        "offset": record.offset,
-                        "key": record.key,
-                        "value": record.value,
-                        "timestamp": record.timestamp,
-                        "headers": dict(record.headers) if record.headers else {},
-                    }
-                    messages.append(message)
+            # Poll for messages (confluent-kafka polls one message at a time)
+            while len(messages) < max_msgs:
+                msg = self._consumer.poll(timeout=timeout_seconds)
 
-                    # Record metrics
-                    kafka_messages_consumed_total.labels(
-                        topic=record.topic,
-                        group_id=self.config.group_id,
-                        status="success",
-                    ).inc()
-
-                # Limit to max_messages if specified
-                if max_messages and len(messages) >= max_messages:
+                if msg is None:
+                    # No more messages within timeout
                     break
+
+                if msg.error():
+                    # Handle error
+                    if msg.error().code() == KafkaError._PARTITION_EOF:
+                        # End of partition - not an error
+                        logger.debug(f"Reached end of partition: {msg.topic()}[{msg.partition()}]")
+                        continue
+                    else:
+                        logger.error(f"Consumer error: {msg.error()}")
+                        kafka_consumer_errors_total.labels(
+                            group_id=self.config.group_id,
+                            error_type="poll_error",
+                        ).inc()
+                        continue
+
+                # Deserialize based on config
+                value = msg.value()
+                if value and self.config.value_deserializer == "json":
+                    try:
+                        value = json.loads(value.decode("utf-8"))
+                    except:
+                        pass
+                elif value and self.config.value_deserializer == "string":
+                    value = value.decode("utf-8")
+
+                key = msg.key()
+                if key and self.config.key_deserializer == "string":
+                    key = key.decode("utf-8")
+
+                # Build message dict
+                message = {
+                    "topic": msg.topic(),
+                    "partition": msg.partition(),
+                    "offset": msg.offset(),
+                    "key": key,
+                    "value": value,
+                    "timestamp": msg.timestamp()[1] if msg.timestamp()[0] != -1 else None,
+                    "headers": dict(msg.headers()) if msg.headers() else {},
+                }
+                messages.append(message)
+
+                # Record metrics
+                kafka_messages_consumed_total.labels(
+                    topic=msg.topic(),
+                    group_id=self.config.group_id,
+                    status="success",
+                ).inc()
 
             if messages:
                 logger.debug(f"Consumed {len(messages)} messages")
@@ -206,7 +227,7 @@ class KafkaConsumerManager:
             ).inc()
             return []
 
-    def commit(self, offsets: Optional[Dict[TopicPartition, OffsetAndMetadata]] = None):
+    def commit(self, offsets: Optional[List[TopicPartition]] = None):
         """
         Commit offsets.
 
@@ -215,9 +236,9 @@ class KafkaConsumerManager:
         """
         try:
             if offsets:
-                self._consumer.commit(offsets=offsets)
+                self._consumer.commit(offsets=offsets, asynchronous=False)
             else:
-                self._consumer.commit()
+                self._consumer.commit(asynchronous=False)
 
             logger.debug("Offsets committed successfully")
 
@@ -232,11 +253,12 @@ class KafkaConsumerManager:
         Args:
             offsets: Dictionary mapping (topic, partition) to offset
         """
-        kafka_offsets = {}
+        kafka_offsets = []
 
         for (topic, partition), offset in offsets.items():
-            tp = TopicPartition(topic, partition)
-            kafka_offsets[tp] = OffsetAndMetadata(offset, None)
+            # confluent-kafka uses offset+1 for commit (next message to read)
+            tp = TopicPartition(topic, partition, offset + 1)
+            kafka_offsets.append(tp)
 
         self.commit(kafka_offsets)
 
@@ -249,8 +271,8 @@ class KafkaConsumerManager:
             partition: Partition number
             offset: Target offset
         """
-        tp = TopicPartition(topic, partition)
-        self._consumer.seek(tp, offset)
+        tp = TopicPartition(topic, partition, offset)
+        self._consumer.seek(tp)
         logger.debug(f"Seeked to offset {offset} on {topic}:{partition}")
 
     def seek_to_beginning(self, partitions: Optional[List[TopicPartition]] = None):
@@ -260,10 +282,13 @@ class KafkaConsumerManager:
         Args:
             partitions: Specific partitions (None = all assigned)
         """
-        if partitions:
-            self._consumer.seek_to_beginning(*partitions)
-        else:
-            self._consumer.seek_to_beginning()
+        if not partitions:
+            # Get assigned partitions
+            partitions = self._consumer.assignment()
+
+        for tp in partitions:
+            tp_beginning = TopicPartition(tp.topic, tp.partition, OFFSET_BEGINNING)
+            self._consumer.seek(tp_beginning)
 
         logger.debug("Seeked to beginning")
 
@@ -274,10 +299,13 @@ class KafkaConsumerManager:
         Args:
             partitions: Specific partitions (None = all assigned)
         """
-        if partitions:
-            self._consumer.seek_to_end(*partitions)
-        else:
-            self._consumer.seek_to_end()
+        if not partitions:
+            # Get assigned partitions
+            partitions = self._consumer.assignment()
+
+        for tp in partitions:
+            tp_end = TopicPartition(tp.topic, tp.partition, OFFSET_END)
+            self._consumer.seek(tp_end)
 
         logger.debug("Seeked to end")
 
@@ -304,7 +332,7 @@ class KafkaConsumerManager:
             partitions: List of (topic, partition) tuples
         """
         topic_partitions = [TopicPartition(t, p) for t, p in partitions]
-        self._consumer.pause(*topic_partitions)
+        self._consumer.pause(topic_partitions)
         logger.info(f"Paused {len(partitions)} partitions")
 
     def resume(self, partitions: List[Tuple[str, int]]):
@@ -315,7 +343,7 @@ class KafkaConsumerManager:
             partitions: List of (topic, partition) tuples
         """
         topic_partitions = [TopicPartition(t, p) for t, p in partitions]
-        self._consumer.resume(*topic_partitions)
+        self._consumer.resume(topic_partitions)
         logger.info(f"Resumed {len(partitions)} partitions")
 
     def get_partitions(self, topic: str) -> List[int]:
@@ -328,8 +356,10 @@ class KafkaConsumerManager:
         Returns:
             List of partition numbers
         """
-        partitions = self._consumer.partitions_for_topic(topic)
-        return list(partitions) if partitions else []
+        metadata = self._consumer.list_topics(topic=topic, timeout=10)
+        if topic in metadata.topics:
+            return list(metadata.topics[topic].partitions.keys())
+        return []
 
     def get_watermarks(self, topic: str, partition: int) -> Dict[str, int]:
         """
@@ -343,13 +373,11 @@ class KafkaConsumerManager:
             Dictionary with 'low' and 'high' watermarks
         """
         tp = TopicPartition(topic, partition)
-
-        beginning = self._consumer.beginning_offsets([tp])
-        end = self._consumer.end_offsets([tp])
+        low, high = self._consumer.get_watermark_offsets(tp, timeout=10)
 
         return {
-            "low": beginning[tp],
-            "high": end[tp],
+            "low": low,
+            "high": high,
         }
 
     def get_metrics(self) -> Dict[str, Any]:
@@ -357,10 +385,17 @@ class KafkaConsumerManager:
         Get consumer metrics.
 
         Returns:
-            Dictionary of metrics
+            Dictionary of metrics (assignment info)
         """
         try:
-            return self._consumer.metrics()
+            assignment = self._consumer.assignment()
+            return {
+                "assigned_partitions": len(assignment) if assignment else 0,
+                "partitions": [
+                    {"topic": tp.topic, "partition": tp.partition}
+                    for tp in assignment
+                ] if assignment else [],
+            }
         except Exception as e:
             logger.error(f"Failed to get consumer metrics: {e}")
             return {}
@@ -370,10 +405,10 @@ class KafkaConsumerManager:
         Close consumer connection.
 
         Args:
-            autocommit: Commit offsets on close
+            autocommit: Commit offsets on close (ignored in confluent-kafka, always commits if auto-commit enabled)
         """
         try:
-            self._consumer.close(autocommit=autocommit)
+            self._consumer.close()
             logger.info("Kafka consumer closed")
 
         except Exception as e:

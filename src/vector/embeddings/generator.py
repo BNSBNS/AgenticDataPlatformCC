@@ -3,7 +3,15 @@ Embedding generation for vector search.
 """
 
 from typing import List, Optional
-import openai
+import os
+
+# Try to import OpenAI - it's an optional dependency
+try:
+    import openai
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+    openai = None
 
 from src.common.config import get_config
 from src.common.logging import get_logger
@@ -23,7 +31,22 @@ class EmbeddingGenerator:
 
         Args:
             model: Embedding model to use
+
+        Raises:
+            ImportError: If OpenAI library is not installed
+            ValueError: If OPENAI_API_KEY environment variable is not set
         """
+        if not OPENAI_AVAILABLE:
+            raise ImportError(
+                "OpenAI library not installed. Install with: pip install openai"
+            )
+
+        if not os.getenv("OPENAI_API_KEY"):
+            raise ValueError(
+                "OPENAI_API_KEY environment variable not set. "
+                "Set it with: export OPENAI_API_KEY=your_api_key"
+            )
+
         self.config = get_config()
         self.model = model
 
