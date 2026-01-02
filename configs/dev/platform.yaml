@@ -1,0 +1,136 @@
+# ==============================================================================
+# DEVELOPMENT ENVIRONMENT CONFIGURATION
+# ==============================================================================
+# This file contains development-specific configuration for the data platform.
+# Environment variables in .env will override these settings.
+
+environment: development
+debug: true
+log_level: INFO
+
+# ==============================================================================
+# LAKEHOUSE CONFIGURATION
+# ==============================================================================
+lakehouse:
+  layers:
+    bronze:
+      description: "Raw, immutable data"
+      retention_days: 90
+      compression: "snappy"
+      partition_spec: "day"
+
+    silver:
+      description: "Validated, refined data"
+      retention_days: 730
+      compression: "zstd"
+      partition_spec: "day"
+
+    gold:
+      description: "Curated, business-ready data"
+      retention_days: 2555
+      compression: "zstd"
+      partition_spec: "month"
+
+  iceberg:
+    catalog: "rest"
+    warehouse: "s3://lakehouse/warehouse"
+    format_version: 2
+
+  paimon:
+    warehouse: "s3://lakehouse/paimon-warehouse"
+    write_mode: "change-log"
+
+# ==============================================================================
+# STREAMING CONFIGURATION
+# ==============================================================================
+streaming:
+  kafka:
+    topics:
+      - name: "raw-events"
+        partitions: 6
+        replication_factor: 3
+        config:
+          retention.ms: 604800000  # 7 days
+          cleanup.policy: "delete"
+
+      - name: "cdc-streams"
+        partitions: 6
+        replication_factor: 3
+        config:
+          retention.ms: 2592000000  # 30 days
+          cleanup.policy: "compact"
+
+      - name: "api-events"
+        partitions: 3
+        replication_factor: 3
+        config:
+          retention.ms: 604800000  # 7 days
+
+      - name: "mcp-requests"
+        partitions: 3
+        replication_factor: 3
+        config:
+          retention.ms: 259200000  # 3 days
+
+      - name: "dead-letter-queue"
+        partitions: 3
+        replication_factor: 3
+        config:
+          retention.ms: 2592000000  # 30 days
+
+  flink:
+    parallelism: 4
+    checkpoint_interval_ms: 60000
+    min_pause_between_checkpoints_ms: 30000
+    checkpoint_timeout_ms: 600000
+    max_concurrent_checkpoints: 1
+    enable_unaligned_checkpoints: false
+
+# ==============================================================================
+# DATA QUALITY
+# ==============================================================================
+data_quality:
+  rules:
+    - name: "no_null_ids"
+      description: "Primary keys must not be null"
+      severity: "critical"
+
+    - name: "valid_timestamps"
+      description: "Timestamps must be within reasonable range"
+      severity: "high"
+
+    - name: "schema_conformance"
+      description: "Data must conform to registered schema"
+      severity: "critical"
+
+# ==============================================================================
+# SECURITY
+# ==============================================================================
+security:
+  authentication:
+    enabled: true
+    methods: ["jwt", "api_key"]
+
+  authorization:
+    enabled: true
+    default_policy: "deny"
+
+  encryption:
+    at_rest: true
+    in_transit: true
+
+  audit_logging:
+    enabled: true
+    log_all_access: true
+
+# ==============================================================================
+# FEATURE FLAGS
+# ==============================================================================
+features:
+  paimon: true
+  vector_search: true
+  mcp: true
+  datahub: true
+  openlineage: true
+  data_quality: true
+  agents: true
