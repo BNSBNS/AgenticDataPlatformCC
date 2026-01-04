@@ -128,3 +128,4 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "requires_kafka: Tests that require Kafka")
     config.addinivalue_line("markers", "requires_postgres: Tests that require PostgreSQL")
     config.addinivalue_line("markers", "requires_minio: Tests that require MinIO")
+    config.addinivalue_line("markers", "requires_pinecone: Tests that require Pinecone")
